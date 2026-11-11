@@ -208,18 +208,26 @@ class Parser:
                 self.index += 1
             elif self.at_kw("WORK"):
                 self.index += 1
+            self._end_statement()
             return {"type": "begin"}
         if word == "COMMIT":
             self.index += 1
             if self.at_kw("WORK"):
                 self.index += 1
+            self._end_statement()
             return {"type": "commit"}
         if word == "ROLLBACK":
             self.index += 1
             if self.at_kw("WORK"):
                 self.index += 1
+            self._end_statement()
             return {"type": "rollback"}
         raise UnsupportedSQL("unsupported statement: %s" % token.value)
+
+    def _end_statement(self):
+        """消费语句结束符；后面还有内容说明是第二条语句，必须报错。"""
+        if not self.end_of_statement():
+            raise UnsupportedSQL("trailing tokens after statement")
 
     def parse_create_table(self):
         name = self.expect_ident()
@@ -353,11 +361,11 @@ class Parser:
 
     def parse_select(self):
         projections = []
-        if self.at_punct("*"):
-            self.index += 1
-            projections.append({"expr": {"kind": "star"}, "alias": None})
-        else:
-            while True:
+        while True:
+            if self.at_punct("*"):
+                self.index += 1
+                projections.append({"expr": {"kind": "star"}, "alias": None})
+            else:
                 expr = self.parse_expr()
                 alias = None
                 if self.at_kw("AS"):
@@ -366,10 +374,10 @@ class Parser:
                 elif self.peek() is not None and self.peek().kind == "ident":
                     alias = self.expect_ident()
                 projections.append({"expr": expr, "alias": alias})
-                if self.at_punct(","):
-                    self.index += 1
-                    continue
-                break
+            if self.at_punct(","):
+                self.index += 1
+                continue
+            break
         self.expect_kw("FROM")
         table = self.expect_ident()
         where = None

@@ -3,19 +3,20 @@
 磁盘布局（全部位于 /data 下）：
 
     /data/catalog.json                 表结构清单
-    /data/commit.log                   提交点记录，每行一个 JSON
+    /data/commit.log                   提交点记录，每次提交追加一行 JSON
     /data/tables/<table>/wal.bin       行元信息日志（row_id / pk / 删除标记）
     /data/tables/<table>/cols/<c>.dat  列数据，槽位下标 = row_id，8 字节定长
     /data/tables/<table>/cols/<c>.str  VARCHAR 字符串堆（追加写）
     /data/tables/<table>/vec.f32       向量块，偏移 = row_id * dim * 4
 
 设计要点：
-    * 列为定长槽位，可直接 mmap 并做 numpy 向量化比较，避免逐行 JSON 解析。
-    * 行版本 row_id 单调递增且稠密；更新一条记录即分配新 row_id 写新槽位，
+    * 列为定长槽位，按 row_id 分段读取；不做整列载入，避免大表撑爆内存。
+    * 行版本 row_id 单调递增；更新一条记录即分配新 row_id 写新槽位，
       旧槽位自然失效，回滚时按提交点截断文件即可。
-    * 向量以定长块存放，同样可 mmap 后向量化计算距离。
-    * commit.log 记录每次提交时各文件的长度；启动时截断到最后一个提交点，
-      因此「已确认提交不丢、未提交不部分生效」。
+    * 向量以定长块存放，同样按连续段读取；扫描与建索引均分块流式处理。
+    * commit.log 每次提交只追加一行，覆盖所有表的文件长度；启动时截断到
+      最后一个提交点，因此「已确认提交不丢、未提交不部分生效」。
+    * 恢复是可重入的：截断与重放都是幂等操作，重复恢复不会改变结果。
 """
 
 import json
@@ -29,6 +30,15 @@ SLOT_WIDTH = 8
 # VARCHAR 槽位：('off','<u4'),('len','<u4')
 VARCHAR_SLOT = np.dtype([("off", "<u4"), ("len", "<u4")])
 BIGINT_SLOT = np.dtype("<i8")
+
+# 一次 pread 的字节上限，避免单次读入过多数据
+READ_CHUNK = 1 << 20
+# 向量连续段的最大空洞：空洞小于该值时仍合并为一次读
+GAP_THRESHOLD = 64
+# 向量常驻内存的字节上限；超过就只走磁盘分块读取
+VECTOR_CACHE_LIMIT = 64 << 20
+# 分块读写的向量条数
+CHUNK = 4096
 
 
 def _fsync_dir(path):
@@ -90,7 +100,10 @@ class ColumnStore:
         避免「扩展文件后定位与写入位置不一致」的问题。
         """
         if self.is_text:
-            payload = value.encode("utf-8")
+            if isinstance(value, bytes):
+                payload = value
+            else:
+                payload = str(value).encode("utf-8")
             offset = self.str_len
             os.pwrite(self.str_fd, payload, offset)
             self.str_len += len(payload)
@@ -114,51 +127,110 @@ class ColumnStore:
             if fd is not None:
                 os.fsync(fd)
 
-    def values_at(self, row_ids):
-        """读取指定 row_id 的值列表。row_ids 为 numpy 整数数组。"""
-        if len(row_ids) == 0:
-            return []
-        if self.is_text:
-            blob = self._string_blob()
-            slots = self._slot_array()[row_ids]
-            out = []
-            for offset, length in zip(slots["off"], slots["len"]):
-                out.append(blob[offset:offset + length].decode("utf-8"))
-            return out
-        raw = self._slot_array()[row_ids]
-        return [int(x) for x in raw]
+    # ---- 读取 ----
 
-    def _slot_array(self):
-        """返回槽位数组。
+    def _slots_for(self, row_ids):
+        """返回 (去重后的 row_id 数组, 对应槽位数组, 每个请求行在数组中的位置)。
 
-        不使用 memmap：文件扩展后已建立的 memmap 视图不会反映新写入的页，
-        会读到补零前的旧内容。这里用 os.pread 读取，保证是文件当前的真实字节。
+        只读取 row_id 落在文件范围内的部分，并按连续段合并 pread，
+        既避免整列载入内存，也避免逐行系统调用。
         """
         dtype = VARCHAR_SLOT if self.is_text else BIGINT_SLOT
+        empty = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=dtype),
+                 np.zeros(0, dtype=np.int64))
         if self.data_fd is None:
-            return np.zeros(0, dtype=dtype)
-        size = os.fstat(self.data_fd).st_size
-        count = min(self.data_len, size) // SLOT_WIDTH
-        if count == 0:
-            return np.zeros(0, dtype=dtype)
-        raw = os.pread(self.data_fd, count * SLOT_WIDTH, 0)
-        return np.frombuffer(raw, dtype=dtype, count=count)
+            return empty
+        ids = np.unique(np.asarray(row_ids, dtype=np.int64))
+        limit = self.data_len // SLOT_WIDTH
+        ids = ids[ids < limit]
+        if len(ids) == 0:
+            return empty
+        out = np.zeros(len(ids), dtype=dtype)
+        breaks = np.nonzero(np.diff(ids) != 1)[0]
+        starts = np.concatenate(([0], breaks + 1))
+        ends = np.concatenate((breaks, [len(ids) - 1]))
+        for begin, end in zip(starts, ends):
+            low = int(ids[begin])
+            high = int(ids[end])
+            raw = os.pread(self.data_fd, (high - low + 1) * SLOT_WIDTH, low * SLOT_WIDTH)
+            got = np.frombuffer(raw, dtype=dtype, count=high - low + 1)
+            out[begin:end + 1] = got
+        positions = np.searchsorted(ids, np.asarray(row_ids, dtype=np.int64))
+        positions = np.clip(positions, 0, max(len(ids) - 1, 0))
+        return ids, out, positions
 
-    def _string_blob(self):
-        if self.str_fd is None:
-            return b""
-        size = os.fstat(self.str_fd).st_size
-        if size == 0:
-            return b""
-        return os.pread(self.str_fd, size, 0)
+    def _read_text(self, slots):
+        """按合并后的区间读取字符串堆，返回与 slots 等长的 bytes 列表。"""
+        count = len(slots)
+        if count == 0 or self.str_fd is None:
+            return [b""] * count
+        offsets = slots["off"].astype(np.int64)
+        lengths = slots["len"].astype(np.int64)
+        order = np.argsort(offsets, kind="stable")
+        merged = []          # [start, end)
+        for index in order:
+            start = int(offsets[index])
+            end = start + int(lengths[index])
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                if end > merged[-1][1]:
+                    merged[-1][1] = end
+            else:
+                merged.append([start, end])
+        if not merged:
+            return [b""] * count
+        starts = np.array([item[0] for item in merged], dtype=np.int64)
+        blobs = []
+        for start, end in merged:
+            blobs.append(os.pread(self.str_fd, end - start, start))
+        out = []
+        for index in range(count):
+            start = int(offsets[index])
+            end = start + int(lengths[index])
+            if end <= start:
+                out.append(b"")
+                continue
+            slot = int(np.searchsorted(starts, start, side="right")) - 1
+            if slot < 0:
+                out.append(b"")
+                continue
+            base = int(starts[slot])
+            data = blobs[slot]
+            if start < base or end > base + len(data):
+                out.append(b"")
+                continue
+            out.append(data[start - base:end - base])
+        return out
+
+    def values_at(self, row_ids):
+        """读取指定 row_id 的值列表。row_ids 为整数数组。"""
+        row_ids = np.asarray(row_ids, dtype=np.int64)
+        if len(row_ids) == 0:
+            return []
+        ids, slots, positions = self._slots_for(row_ids)
+        if len(ids) == 0:
+            return [None] * len(row_ids)
+        if self.is_text:
+            texts = self._read_text(slots)
+            decoded = [text.decode("utf-8", "replace") for text in texts]
+            return [decoded[pos] for pos in positions]
+        numbers = slots.astype(np.int64)
+        return [int(numbers[pos]) for pos in positions]
 
     def compare_array(self, row_ids):
         """返回可直接做向量化比较的数组（VARCHAR 返回 bytes 列表）。"""
+        row_ids = np.asarray(row_ids, dtype=np.int64)
+        if len(row_ids) == 0:
+            return [] if self.is_text else np.zeros(0, dtype=np.int64)
+        ids, slots, positions = self._slots_for(row_ids)
+        if len(ids) == 0:
+            return [b""] * len(row_ids) if self.is_text else np.zeros(len(row_ids), dtype=np.int64)
         if self.is_text:
-            blob = self._string_blob()
-            slots = self._slot_array()[row_ids]
-            return [blob[o:o + n] for o, n in zip(slots["off"], slots["len"])]
-        return np.asarray(self._slot_array()[row_ids], dtype=np.int64)
+            texts = self._read_text(slots)
+            return [texts[pos] for pos in positions]
+        numbers = slots.astype(np.int64)
+        return numbers[positions]
 
 
 class TableStorage:
@@ -185,6 +257,11 @@ class TableStorage:
         self.live = {}          # pk -> row_id
         self.row_pk = {}        # row_id -> pk
         self.version = 0        # 数据版本号，用于缓存失效
+        self._live_cache = None
+        self._live_cache_version = -1
+        self._vec_cache = None  # 小表时缓存向量，大表不缓存
+        self._vec_cache_len = 0
+        self._vec_cache_off = False
 
     # ---- 打开与恢复 ----
 
@@ -217,19 +294,41 @@ class TableStorage:
             if store is not None:
                 store.truncate(column_marks[0], column_marks[1])
         self._replay()
+        self._refresh_vector_cache()
 
     def _replay(self):
+        """流式重放 WAL。
+
+        逐块读取而不是整段载入内存；遇到半截记录（崩溃导致的撕裂写）即停止，
+        该记录及其之后的记录都视为未提交。
+        """
         if self.wal_len == 0:
             return
-        raw = os.pread(self.wal_fd, self.wal_len, 0)
-        offset = 0
-        while offset + LENGTH_PREFIX.size <= self.wal_len:
-            size = LENGTH_PREFIX.unpack(raw[offset:offset + LENGTH_PREFIX.size])[0]
-            start = offset + LENGTH_PREFIX.size
-            payload = raw[start:start + size]
-            if len(payload) != size:
+        buffer = b""
+        base = 0     # buffer[0] 对应的文件偏移
+        pos = 0      # 当前解析位置（相对 buffer）
+        header = LENGTH_PREFIX.size
+        while True:
+            while len(buffer) - pos < header:
+                more = os.pread(self.wal_fd, READ_CHUNK, base + len(buffer))
+                if not more:
+                    break
+                buffer += more
+            if len(buffer) - pos < header:
                 break
-            record = json.loads(payload.decode("utf-8"))
+            size = LENGTH_PREFIX.unpack(buffer[pos:pos + header])[0]
+            while len(buffer) - pos < header + size:
+                more = os.pread(self.wal_fd, READ_CHUNK, base + len(buffer))
+                if not more:
+                    break
+                buffer += more
+            if len(buffer) - pos < header + size:
+                break
+            payload = buffer[pos + header:pos + header + size]
+            try:
+                record = json.loads(payload.decode("utf-8"))
+            except (ValueError, UnicodeError):
+                break
             row_id = record["row_id"]
             pk = record["pk"]
             self.next_row_id = max(self.next_row_id, row_id + 1)
@@ -239,7 +338,13 @@ class TableStorage:
             else:
                 self.live[pk] = row_id
                 self.row_pk[row_id] = pk
-            offset = start + size
+            pos += header + size
+            if pos >= READ_CHUNK:
+                buffer = buffer[pos:]
+                base += pos
+                pos = 0
+        self.version += 1
+        self._live_cache = None
 
     # ---- 提交点与回滚 ----
 
@@ -251,6 +356,7 @@ class TableStorage:
                 "next_row_id": self.next_row_id, "cols": cols}
 
     def restore(self, checkpoint):
+        """回滚到检查点：截断文件后重放 WAL（幂等，可重复执行）。"""
         self.wal_len = checkpoint["wal_len"]
         self.vec_len = checkpoint["vec_len"]
         self.next_row_id = checkpoint["next_row_id"]
@@ -264,6 +370,8 @@ class TableStorage:
         self.row_pk = {}
         self._replay()
         self.version += 1
+        self._live_cache = None
+        self._refresh_vector_cache()
 
     # ---- 写入 ----
 
@@ -285,6 +393,7 @@ class TableStorage:
             if target > current:
                 os.pwrite(self.vec_fd, b"\x00" * (target - current), current)
             self.vec_len = target
+        self._cache_vector(row_id, array)
 
     def append_wal(self, row_id, pk, deleted):
         record = {"row_id": row_id, "pk": pk, "deleted": deleted}
@@ -307,23 +416,59 @@ class TableStorage:
         self.live[pk] = row_id
         self.row_pk[row_id] = pk
         self.version += 1
+        self._live_cache = None
 
     def delete_row(self, row_id, pk):
         self.append_wal(row_id, pk, True)
         self.live.pop(pk, None)
         self.row_pk.pop(row_id, None)
         self.version += 1
+        self._live_cache = None
 
     # ---- 读取 ----
 
     def live_row_ids(self):
-        return np.fromiter(self.live.values(), dtype=np.int64, count=len(self.live))
+        """当前存活行的 row_id（升序）。带版本缓存，避免重复排序。"""
+        if self._live_cache is None or self._live_cache_version != self.version:
+            self._live_cache = np.array(sorted(self.live.values()), dtype=np.int64)
+            self._live_cache_version = self.version
+        return self._live_cache
 
     def live_pks(self):
-        return np.fromiter(self.live.keys(), dtype=np.int64, count=len(self.live))
+        return np.array(sorted(self.live.keys()), dtype=np.int64)
 
     def column_values(self, name, row_ids):
+        if name == self.vector_column:
+            return self.vector_values(row_ids)
         return self.stores[name].values_at(row_ids)
+
+    def vector_values(self, row_ids):
+        """返回向量列的取值：JSON 数组形式的 float32 列表。
+
+        按传入 row_ids 的顺序返回，逐块读取，避免一次持有整表向量。
+        """
+        row_ids = np.asarray(row_ids, dtype=np.int64)
+        if self.vector_dim <= 0 or len(row_ids) == 0:
+            return []
+        out = []
+        for begin in range(0, len(row_ids), CHUNK):
+            window = row_ids[begin:begin + CHUNK]
+            ids, block = self.read_vectors(window)
+            if len(ids) == 0:
+                out.extend([[0.0] * self.vector_dim for _ in range(len(window))])
+                continue
+            positions = np.searchsorted(ids, window)
+            positions = np.clip(positions, 0, len(ids) - 1)
+            out.extend([[float(x) for x in row] for row in block[positions].tolist()])
+        return out
+
+    def primary_key_values(self, row_ids):
+        """返回指定 row_id 对应的主键（int64 数组）。"""
+        row_ids = np.asarray(row_ids, dtype=np.int64)
+        if len(row_ids) == 0:
+            return np.zeros(0, dtype=np.int64)
+        return np.asarray(self.stores[self.primary_key].compare_array(row_ids),
+                          dtype=np.int64)
 
     def column_compare(self, name, row_ids):
         return self.stores[name].compare_array(row_ids)
@@ -337,28 +482,114 @@ class TableStorage:
             return np.zeros(self.vector_dim, dtype=np.float32)
         return np.frombuffer(raw, dtype="<f4")
 
+    def _vector_runs(self, ids):
+        """把递增的 row_id 切成连续段（允许小空洞），返回 (low, high, 切片)。"""
+        runs = []
+        begin = 0
+        for index in range(1, len(ids)):
+            if int(ids[index]) - int(ids[index - 1]) > GAP_THRESHOLD:
+                runs.append((int(ids[begin]), int(ids[index - 1]), slice(begin, index)))
+                begin = index
+        runs.append((int(ids[begin]), int(ids[-1]), slice(begin, len(ids))))
+        return runs
+
+    def _refresh_vector_cache(self):
+        """在内存预算之内缓存向量；超出预算则不缓存，改走磁盘分块读取。"""
+        self._vec_cache = None
+        self._vec_cache_len = 0
+        self._vec_cache_off = False
+        if self.vector_dim <= 0:
+            return
+        count = self.vec_len // 4 // self.vector_dim
+        if count * self.vector_dim * 4 > VECTOR_CACHE_LIMIT:
+            self._vec_cache_off = True
+            return
+        raw = os.pread(self.vec_fd, count * self.vector_dim * 4, 0)
+        if len(raw) < count * self.vector_dim * 4:
+            self._vec_cache_off = True
+            return
+        self._vec_cache = np.frombuffer(raw, dtype="<f4").reshape(count, self.vector_dim).copy()
+        self._vec_cache_len = count
+
+    def _cache_vector(self, row_id, values):
+        """把刚写入的向量同步进内存缓存（超出预算则放弃缓存）。"""
+        if self.vector_dim <= 0 or self._vec_cache_off:
+            return
+        needed = (row_id + 1) * self.vector_dim * 4
+        if needed > VECTOR_CACHE_LIMIT:
+            self._vec_cache = None
+            self._vec_cache_len = 0
+            self._vec_cache_off = True
+            return
+        if self._vec_cache is None:
+            self._vec_cache = np.zeros((0, self.vector_dim), dtype=np.float32)
+        if row_id >= len(self._vec_cache):
+            grow = max(row_id + 1, max(1024, len(self._vec_cache) * 2))
+            if grow * self.vector_dim * 4 > VECTOR_CACHE_LIMIT:
+                grow = row_id + 1
+                if grow * self.vector_dim * 4 > VECTOR_CACHE_LIMIT:
+                    self._vec_cache = None
+                    self._vec_cache_len = 0
+                    self._vec_cache_off = True
+                    return
+            block = np.zeros((grow, self.vector_dim), dtype=np.float32)
+            block[:len(self._vec_cache)] = self._vec_cache
+            self._vec_cache = block
+        self._vec_cache[row_id] = values
+        self._vec_cache_len = max(self._vec_cache_len, row_id + 1)
+
+    def iter_vector_batches(self, row_ids, size=CHUNK):
+        """按块产出 (row_id 数组, 向量数组)。
+
+        命中内存缓存时直接切片；否则按连续段从磁盘读，每次只驻留一块。
+        """
+        if self.vector_dim <= 0 or len(row_ids) == 0:
+            return
+        count = self.vec_len // 4 // self.vector_dim
+        ids = np.unique(np.asarray(row_ids, dtype=np.int64))
+        ids = ids[ids < count]
+        if len(ids) == 0:
+            return
+        for begin in range(0, len(ids), size):
+            window = ids[begin:begin + size]
+            if self._vec_cache is not None and int(window[-1]) < len(self._vec_cache):
+                yield window, self._vec_cache[window]
+                continue
+            for low, high, part in self._vector_runs(window):
+                raw = os.pread(self.vec_fd, (high - low + 1) * self.vector_dim * 4,
+                               low * self.vector_dim * 4)
+                block = np.frombuffer(raw, dtype="<f4").reshape(-1, self.vector_dim)
+                yield window[part], block[window[part] - low]
+
+    def read_vectors(self, row_ids):
+        """读取多个向量，返回 (row_id 数组, (n, dim) float32)。
+
+        调用方应对 row_ids 分块传入，避免一次持有全表向量。
+        """
+        if self.vector_dim <= 0 or len(row_ids) == 0:
+            return (np.zeros(0, dtype=np.int64),
+                    np.zeros((0, max(self.vector_dim, 1)), dtype=np.float32))
+        size = os.fstat(self.vec_fd).st_size
+        count = min(self.vec_len, size) // 4 // self.vector_dim
+        ids = np.unique(np.asarray(row_ids, dtype=np.int64))
+        ids = ids[ids < count]
+        if len(ids) == 0:
+            return ids, np.zeros((0, self.vector_dim), dtype=np.float32)
+        out = np.zeros((len(ids), self.vector_dim), dtype=np.float32)
+        for low, high, window in self._vector_runs(ids):
+            raw = os.pread(self.vec_fd, (high - low + 1) * self.vector_dim * 4,
+                           low * self.vector_dim * 4)
+            block = np.frombuffer(raw, dtype="<f4").reshape(-1, self.vector_dim)
+            out[window] = block[ids[window] - low]
+        return ids, out
+
     def vector_block(self, row_ids):
         """向量化读取多个向量，返回 (n, dim) float32 数组。
 
-        用 os.pread 而非 memmap：文件扩展后 memmap 视图不会反映新写入的页。
+        保留旧接口，内部走分段读取。
         """
-        if self.vector_dim <= 0 or len(row_ids) == 0:
-            return np.zeros((0, max(self.vector_dim, 1)), dtype=np.float32)
-        size = os.fstat(self.vec_fd).st_size
-        count = min(self.vec_len, size) // 4 // self.vector_dim
-        if count == 0:
-            return np.zeros((0, self.vector_dim), dtype=np.float32)
-        row_ids = np.asarray(row_ids, dtype=np.int64)
-        row_ids = row_ids[row_ids < count]
-        if len(row_ids) == 0:
-            return np.zeros((0, self.vector_dim), dtype=np.float32)
-        # 连续区间一次性读取，减少系统调用
-        low = int(row_ids.min())
-        high = int(row_ids.max())
-        raw = os.pread(self.vec_fd, (high - low + 1) * self.vector_dim * 4,
-                       low * self.vector_dim * 4)
-        block = np.frombuffer(raw, dtype="<f4").reshape(-1, self.vector_dim)
-        return block[row_ids - low].astype(np.float32, copy=True)
+        _, block = self.read_vectors(row_ids)
+        return block
 
     def flush(self):
         for fd in (self.wal_fd, self.vec_fd):
@@ -412,7 +643,12 @@ class Database:
         return data.get("tables") or {}
 
     def _read_commit_log(self):
-        """读取每个表最后一次提交的文件长度；截断的尾行视为未提交。"""
+        """读取每个表最后一次提交的文件长度；截断的尾行视为未提交。
+
+        兼容两种格式：
+            旧格式：每行一个表 {"table": name, "wal_len": ...}
+            新格式：每行一次提交 {"tables": {name: {...}}}（多表原子提交）
+        """
         result = {}
         if not os.path.exists(self.commit_path):
             return result
@@ -425,9 +661,15 @@ class Database:
                 entry = json.loads(line.decode("utf-8"))
             except (ValueError, UnicodeError):
                 continue
-            table = entry.get("table")
-            if table:
-                result[table] = entry
+            tables = entry.get("tables")
+            if isinstance(tables, dict):
+                for name, mark in tables.items():
+                    if isinstance(mark, dict):
+                        result[name] = mark
+                continue
+            name = entry.get("table")
+            if name:
+                result[name] = entry
         return result
 
     def create_table(self, name, schema):
@@ -455,19 +697,23 @@ class Database:
         _fsync_dir(self.data_dir)
 
     def commit(self):
-        """提交点：落盘所有表并追加 commit.log。"""
+        """提交点：落盘所有表并向 commit.log 追加一行。
+
+        一次提交只写一行，覆盖所有表的长度信息；因此多表事务要么整体生效，
+        要么整体不生效，不会出现「一行写了一半」的中间状态。
+        """
         for table in self.tables.values():
             table.flush()
-        entries = []
+        tables = {}
         for name, table in self.tables.items():
             cols = {}
             for column_name, store in table.stores.items():
                 cols[column_name] = [store.data_len, store.str_len]
-            entries.append({"table": name, "wal_len": table.wal_len,
-                            "vec_len": table.vec_len, "cols": cols})
+            tables[name] = {"wal_len": table.wal_len, "vec_len": table.vec_len,
+                            "cols": cols}
+        payload = json.dumps({"tables": tables}, ensure_ascii=False).encode("utf-8")
         with open(self.commit_path, "ab") as handle:
-            for entry in entries:
-                handle.write((json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8"))
+            handle.write(payload + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
 

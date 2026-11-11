@@ -7,10 +7,12 @@
     崩溃（进程被强杀）时，commit.log 最后一个提交点之后的数据被丢弃，
     因此「已确认提交不丢、未提交不部分生效」。
 
-查询性能：
-    普通列过滤与向量距离都用 numpy 向量化完成，避免逐行解释。
+查询性能与内存：
+    普通列过滤与向量距离都分块向量化计算；向量不整体驻留内存，
+    大表的数据量可以超过内存预算。
 """
 
+import functools
 import json
 
 import numpy as np
@@ -22,13 +24,13 @@ from .errors import (DimensionMismatch, DuplicateKey, InvalidVector, InvalidValu
 from .storage import Database
 from .vectorindex import VectorIndex
 
+# 扫描与排序的分块大小
+CHUNK = 4096
+
 
 class Transaction:
     def __init__(self):
         self.checkpoints = {}
-        self.live_backup = {}
-        self.row_pk_backup = {}
-        self.next_row_backup = {}
 
 
 class Engine:
@@ -47,18 +49,13 @@ class Engine:
             if not table.vector_column:
                 continue
             index = VectorIndex(table.vector_dim)
-            if not index.load(table.index_dir) or not index.row_ids:
+            if not index.load(table.index_dir) or not index.is_current(table):
                 index = self._build_index(table)
             self.indexes[name] = index
 
     def _build_index(self, table):
         index = VectorIndex(table.vector_dim)
-        row_ids = np.array(sorted(table.live.values()), dtype=np.int64)
-        if len(row_ids) == 0:
-            index.build(np.zeros((0, table.vector_dim), dtype=np.float32), [])
-            return index
-        vectors = table.vector_block(row_ids)
-        index.build(vectors, row_ids.tolist())
+        index.build(table, table.live_row_ids())
         index.save(table.index_dir)
         return index
 
@@ -71,9 +68,6 @@ class Engine:
         self.transaction = Transaction()
         for name, table in self.db.tables.items():
             self.transaction.checkpoints[name] = table.checkpoint()
-            self.transaction.live_backup[name] = dict(table.live)
-            self.transaction.row_pk_backup[name] = dict(table.row_pk)
-            self.transaction.next_row_backup[name] = table.next_row_id
 
     def commit(self):
         if not self.in_transaction:
@@ -89,10 +83,8 @@ class Engine:
             table = self.db.tables.get(name)
             if table is None:
                 continue
+            # 截断 + 重放 WAL 即可恢复内存状态，无需额外备份整表
             table.restore(checkpoint)
-            table.live = self.transaction.live_backup.get(name, {})
-            table.row_pk = self.transaction.row_pk_backup.get(name, {})
-            table.next_row_id = self.transaction.next_row_backup.get(name, 0)
         self.in_transaction = False
         self.transaction = None
 
@@ -106,9 +98,6 @@ class Engine:
         if table.name in self.transaction.checkpoints:
             return
         self.transaction.checkpoints[table.name] = table.checkpoint()
-        self.transaction.live_backup[table.name] = dict(table.live)
-        self.transaction.row_pk_backup[table.name] = dict(table.row_pk)
-        self.transaction.next_row_backup[table.name] = table.next_row_id
 
     # ---- 分发 ----
 
@@ -157,6 +146,9 @@ class Engine:
         vector_columns = [c for c in columns if c["type"] == "vector"]
         if len(vector_columns) > 1:
             raise UnsupportedSQL("at most one vector column per table")
+        primary_type = next((c["type"] for c in columns if c["name"] == primary), None)
+        if primary_type != "bigint":
+            raise UnsupportedSQL("the primary key must be a BIGINT column")
         schema = {
             "columns": [{"name": c["name"], "type": c["type"], "length": c["length"]}
                         for c in columns],
@@ -195,6 +187,7 @@ class Engine:
         self._snapshot(table)
         # 先整体校验，任何一行失败都不能留下部分修改
         prepared = []
+        batch_pks = set()
         for row in statement["rows"]:
             if len(row) != len(columns):
                 raise InvalidValue("column count does not match value count")
@@ -204,8 +197,9 @@ class Engine:
             pk = values.get(table.primary_key)
             if pk is None:
                 raise InvalidValue("primary key must not be NULL")
-            if pk in table.live:
+            if pk in table.live or pk in batch_pks:
                 raise DuplicateKey("duplicate primary key %r" % pk)
+            batch_pks.add(pk)
             prepared.append((pk, values))
         affected = 0
         for pk, values in prepared:
@@ -293,6 +287,7 @@ class Engine:
         targets = self._match_rows(table, statement["where"])
         # 先整体校验：任何一行失败都不能留下部分修改，改主键的冲突也要先查清
         prepared = []
+        batch_pks = set()
         for pk, row_id in targets:
             values = self._row_values(table, row_id)
             updated = dict(values)
@@ -302,6 +297,10 @@ class Engine:
             new_pk = updated[table.primary_key]
             if new_pk in table.live and table.live[new_pk] != row_id:
                 raise DuplicateKey("duplicate primary key %r" % new_pk)
+            if new_pk in batch_pks:
+                # 同一语句里两行被改成同一个主键
+                raise DuplicateKey("duplicate primary key %r" % new_pk)
+            batch_pks.add(new_pk)
             prepared.append((pk, row_id, updated))
         affected = 0
         for pk, row_id, updated in prepared:
@@ -339,16 +338,29 @@ class Engine:
     def exec_select(self, statement, search_mode):
         table = self._get_table(statement["table"])
         resolved = [self._resolve_projection(table, p) for p in statement["projections"]]
+        resolved = self._expand_star(table, resolved)
         order_terms = [self._resolve_order_term(table, t) for t in statement["order_by"] or []]
         for term in order_terms:
             if term["kind"] == "distance":
                 term["query_array"] = self._coerce_vector_for_query(table, term["query"])
         limit = statement["limit"]
-        has_distance = any(r["kind"] == "distance" for r in resolved)
-        if has_distance:
-            return self._select_vector(table, statement, resolved, limit,
-                                      search_mode, order_terms)
-        return self._select_plain(table, statement, resolved, order_terms, limit)
+        distance_term = next((r for r in resolved if r["kind"] == "distance"), None)
+        if distance_term is None:
+            return self._select_plain(table, statement, resolved, order_terms, limit)
+        return self._select_vector(table, statement, resolved, limit,
+                                   search_mode, order_terms)
+
+    def _expand_star(self, table, resolved):
+        """把 SELECT * 展开成逐列投影，保证输出列与取值一致。"""
+        out = []
+        for item in resolved:
+            if item["kind"] != "star":
+                out.append(item)
+                continue
+            for column in table.schema["columns"]:
+                out.append({"kind": "column", "name": column["name"],
+                            "alias": column["name"]})
+        return out
 
     def _resolve_projection(self, table, projection):
         expr = projection["expr"]
@@ -387,47 +399,133 @@ class Engine:
         raise UnsupportedSQL("unsupported ORDER BY expression")
 
     def _select_plain(self, table, statement, resolved, order_terms, limit):
-        matches = self._match_rows(table, statement["where"])
+        row_ids, pks = self._match_row_ids(table, statement["where"])
         columns = self._output_columns(table, resolved)
-        if not order_terms:
-            # 无 ORDER BY：按主键升序输出（集合比较时顺序不影响结果）
-            matches.sort(key=lambda item: item[0])
-            if limit is not None:
-                matches = matches[:limit]
-            return {"columns": columns, "rows": self._project_rows(table, resolved, matches)}
-        # ORDER BY：取出相关列后向量化排序
-        row_ids = np.array([row_id for _, row_id in matches], dtype=np.int64)
         if len(row_ids) == 0:
             return {"columns": columns, "rows": []}
+        if not order_terms:
+            # 无 ORDER BY：按主键升序输出（集合比较时顺序不影响结果）
+            order = np.argsort(pks, kind="stable")
+            picked = order[:limit] if limit is not None else order
+            return {"columns": columns,
+                    "rows": self._project_rows(table, resolved, row_ids[picked], pks[picked])}
         keys = []
         for term in order_terms:
             if term["kind"] == "column":
-                column = table.stores[term["name"]]
-                values = column.compare_array(row_ids)
-                keys.append((term, values))
+                keys.append((term, table.column_compare(term["name"], row_ids)))
             else:
                 query_vec = term.get("query_array")
                 if query_vec is None:
                     query_vec = self._coerce_vector_for_query(table, term["query"])
-                vectors = table.vector_block(row_ids)
-                diff = vectors - query_vec
-                distances = np.sqrt((diff * diff).sum(axis=1)).astype(np.float64)
-                keys.append((term, distances))
-        order = self._sort_indices(keys, row_ids, table)
+                keys.append((term, self._distances(table, query_vec, row_ids)))
+        order = self._sort_indices(keys, pks)
         if limit is not None:
             order = order[:limit]
-        picked = [(int(table.row_pk.get(row_ids[i], 0)), int(row_ids[i]))
-                  for i in order]
-        return {"columns": columns, "rows": self._project_rows(table, resolved, picked)}
+        return {"columns": columns,
+                "rows": self._project_rows(table, resolved, row_ids[order], pks[order])}
 
-    def _sort_indices(self, keys, row_ids, table):
+    def _select_vector(self, table, statement, resolved, limit, search_mode, order_terms):
+        distance_term = next(r for r in resolved if r["kind"] == "distance")
+        query_vector = self._coerce_vector_for_query(table, distance_term["query"])
+        row_ids, pks = self._match_row_ids(table, statement["where"])
+        columns = self._output_columns(table, resolved)
+        if len(row_ids) == 0:
+            return {"columns": columns, "rows": []}
+        # 只有「按距离升序 + 有 LIMIT」这一种形态可以走 TopK 快路径
+        simple_distance_order = (not order_terms
+                                  or (len(order_terms) == 1
+                                      and order_terms[0]["kind"] == "distance"
+                                      and not order_terms[0]["desc"]))
+        if simple_distance_order and limit is not None:
+            hits = self._topk(table, query_vector, limit, row_ids, search_mode)
+            picked_ids = np.array([rid for rid, _ in hits], dtype=np.int64)
+            picked_d = np.array([dist for _, dist in hits], dtype=np.float64)
+            picked_pks = table.primary_key_values(picked_ids)
+            return {"columns": columns,
+                    "rows": self._project_rows(table, resolved, picked_ids, picked_pks,
+                                               distances=picked_d)}
+        # 通用路径：按 ORDER BY 逐项求键，再整体排序
+        keys = []
+        for term in order_terms:
+            if term["kind"] == "column":
+                keys.append((term, table.column_compare(term["name"], row_ids)))
+            else:
+                query = term.get("query_array")
+                if query is None:
+                    query = self._coerce_vector_for_query(table, term["query"])
+                keys.append((term, self._distances(table, query, row_ids)))
+        order = self._sort_indices(keys, pks)
+        if limit is not None:
+            order = order[:limit]
+        distances = self._distances(table, query_vector, row_ids)
+        return {"columns": columns,
+                "rows": self._project_rows(table, resolved, row_ids[order], pks[order],
+                                           distances=distances[order])}
+
+    def _topk(self, table, query_vector, k, row_ids, search_mode):
+        """按距离升序取前 k 条；同距按主键升序。"""
+        if search_mode == "ann":
+            index = self.indexes.get(table.name)
+            if index is None or not index.is_current(table):
+                index = self._build_index(table)
+                self.indexes[table.name] = index
+            hits = index.search(table, query_vector, k, allowed=row_ids)
+            if hits:
+                return hits
+        return self._exact_topk(table, query_vector, k, row_ids)
+
+    def _exact_topk(self, table, query_vector, k, row_ids):
+        """分块精确扫描取 TopK，内存中只保留 k 条候选。"""
+        query = np.asarray(query_vector, dtype=np.float64)
+        best_dist = np.zeros(0, dtype=np.float64)
+        best_pk = np.zeros(0, dtype=np.int64)
+        best_ids = np.zeros(0, dtype=np.int64)
+        for ids, vectors in table.iter_vector_batches(row_ids):
+            if len(ids) == 0:
+                continue
+            diff = vectors.astype(np.float64) - query
+            dist = np.sqrt((diff * diff).sum(axis=1))
+            pks = table.primary_key_values(ids)
+            best_dist = np.concatenate([best_dist, dist])
+            best_pk = np.concatenate([best_pk, pks])
+            best_ids = np.concatenate([best_ids, ids])
+            if len(best_dist) > 4 * k + CHUNK:
+                order = np.lexsort((best_pk, best_dist))[:k]
+                best_dist, best_pk, best_ids = best_dist[order], best_pk[order], best_ids[order]
+        order = np.lexsort((best_pk, best_dist))[:k]
+        return [(int(best_ids[i]), float(best_dist[i])) for i in order]
+
+    def _distances(self, table, query_vector, row_ids):
+        """分块计算全部距离，返回 float64 数组。"""
+        query = np.asarray(query_vector, dtype=np.float64)
+        out = np.zeros(len(row_ids), dtype=np.float64)
+        for ids, vectors in table.iter_vector_batches(row_ids):
+            if len(ids) == 0:
+                continue
+            diff = vectors.astype(np.float64) - query
+            dist = np.sqrt((diff * diff).sum(axis=1))
+            out[np.searchsorted(row_ids, ids)] = dist
+        return out
+
+    def _sort_indices(self, keys, pks):
         """按多列排序，等距时按主键升序。返回下标数组。"""
-        import functools
+        numeric = all(
+            term["kind"] == "distance" or isinstance(values, np.ndarray)
+            for term, values in keys)
+        if numeric:
+            sort_keys = []
+            for term, values in keys:
+                if term["desc"]:
+                    values = -np.asarray(values, dtype=np.float64) \
+                        if values.dtype.kind == "f" else -np.asarray(values, dtype=np.int64)
+                sort_keys.append(values)
+            # np.lexsort 以最后一个键为主键
+            return np.lexsort(tuple([pks] + list(reversed(sort_keys))))
+        return self._sort_indices_python(keys, pks)
 
+    def _sort_indices_python(self, keys, pks):
         def comparator(i, j):
             for term, values in keys:
-                if values is None:
-                    continue
                 a = values[i]
                 b = values[j]
                 if isinstance(a, bytes) or isinstance(b, bytes):
@@ -445,22 +543,21 @@ class Engine:
                 if term["desc"]:
                     result = -result
                 return result
-            pk_a = int(table.row_pk.get(row_ids[i], 0))
-            pk_b = int(table.row_pk.get(row_ids[j], 0))
+            pk_a = int(pks[i])
+            pk_b = int(pks[j])
             return -1 if pk_a < pk_b else (0 if pk_a == pk_b else 1)
 
-        return sorted(range(len(row_ids)), key=functools.cmp_to_key(comparator))
+        return sorted(range(len(pks)), key=functools.cmp_to_key(comparator))
 
-    def _project_rows(self, table, resolved, matches):
-        if not matches:
+    def _project_rows(self, table, resolved, row_ids, pks, distances=None):
+        if len(row_ids) == 0:
             return []
-        row_ids = np.array([row_id for _, row_id in matches], dtype=np.int64)
         columns = {}
         for item in resolved:
             if item["kind"] == "column":
                 columns[item["name"]] = table.column_values(item["name"], row_ids)
         out = []
-        for position in range(len(matches)):
+        for position in range(len(row_ids)):
             row = []
             for item in resolved:
                 if item["kind"] == "column":
@@ -468,7 +565,8 @@ class Engine:
                 elif item["kind"] == "constant":
                     row.append(item["value"])
                 else:
-                    row.append(None)
+                    row.append(None if distances is None
+                               else float(distances[position]))
             out.append(row)
         return out
 
@@ -482,37 +580,7 @@ class Engine:
                 columns.append(item["alias"])
         return columns
 
-    # ---- 向量查询 ----
-
-    def _select_vector(self, table, statement, resolved, limit, search_mode, order_terms):
-        distance_term = next(r for r in resolved if r["kind"] == "distance")
-        query_vector = self._coerce_vector_for_query(table, distance_term["query"])
-        matches = self._match_rows(table, statement["where"])
-        columns = self._output_columns(table, resolved)
-        if not matches:
-            return {"columns": columns, "rows": []}
-        k = limit if limit is not None else len(matches)
-        row_ids = np.array([row_id for _, row_id in matches], dtype=np.int64)
-        if search_mode == "ann":
-            hits = self._ann_search(table, query_vector, k, row_ids)
-        else:
-            hits = self._exact_search(table, query_vector, k, row_ids)
-        if limit is not None:
-            hits = hits[:limit]
-        rows = []
-        for row_id, distance in hits:
-            row = []
-            for item in resolved:
-                if item["kind"] == "distance":
-                    row.append(distance)
-                elif item["kind"] == "column":
-                    row.append(table.column_values(item["name"], np.array([row_id], dtype=np.int64))[0])
-                elif item["kind"] == "constant":
-                    row.append(item["value"])
-                else:
-                    row.append(None)
-            rows.append(row)
-        return {"columns": columns, "rows": rows}
+    # ---- 向量查询辅助 ----
 
     def _coerce_vector_for_query(self, table, query):
         dim = table.schema.get("vector_dim") or 0
@@ -528,26 +596,6 @@ class Engine:
             raise InvalidVector("query vector must be finite")
         return array
 
-    def _exact_search(self, table, query_vector, k, row_ids):
-        vectors = table.vector_block(row_ids)
-        diff = vectors - query_vector
-        distances = np.sqrt((diff * diff).sum(axis=1)).astype(np.float64)
-        pk_values = table.column_values(table.primary_key, row_ids)
-        order = np.lexsort((np.asarray(pk_values, dtype=np.int64), distances))[:k]
-        return [(int(row_ids[i]), float(distances[i])) for i in order]
-
-    def _ann_search(self, table, query_vector, k, row_ids):
-        index = self.indexes.get(table.name)
-        live_row_ids = set(table.live.values())
-        if index is None or index.dirty or set(index.row_ids) != live_row_ids:
-            index = self._build_index(table)
-            self.indexes[table.name] = index
-        if index.vectors is None or index.vectors.shape[0] == 0:
-            return []
-        allowed = set(row_ids.tolist())
-        candidates = index.search(query_vector, k, allowed=allowed)
-        return [(row_id, distance) for row_id, distance in candidates]
-
     def _invalidate_index(self, table):
         index = self.indexes.get(table.name)
         if index is not None:
@@ -555,21 +603,32 @@ class Engine:
 
     # ---- WHERE 匹配（向量化） ----
 
-    def _match_rows(self, table, where):
-        """返回满足条件的 [(pk, row_id)] 列表。"""
+    def _match_row_ids(self, table, where):
+        """返回满足条件的 (row_id 数组, 主键数组)。分块计算，常驻内存有限。"""
         row_ids = table.live_row_ids()
         if len(row_ids) == 0:
-            return []
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
         if where is None:
-            pks = table.column_values(table.primary_key, row_ids)
-            return list(zip(pks, row_ids.tolist()))
-        mask = np.ones(len(row_ids), dtype=bool)
-        for condition in where["conditions"]:
-            left, right, op = (condition["left"], condition["right"], condition["op"])
-            mask &= self._compare_mask(table, row_ids, left, op, right)
-        selected = row_ids[mask]
-        pks = table.column_values(table.primary_key, selected)
-        return list(zip(pks, selected.tolist()))
+            return row_ids, table.primary_key_values(row_ids)
+        hits = []
+        for begin in range(0, len(row_ids), CHUNK):
+            window = row_ids[begin:begin + CHUNK]
+            mask = np.ones(len(window), dtype=bool)
+            for condition in where["conditions"]:
+                mask &= self._compare_mask(table, window, condition["left"],
+                                           condition["op"], condition["right"])
+            selected = window[mask]
+            if len(selected):
+                hits.append(selected)
+        if not hits:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+        matched = np.concatenate(hits)
+        return matched, table.primary_key_values(matched)
+
+    def _match_rows(self, table, where):
+        """返回满足条件的 [(pk, row_id)] 列表。"""
+        row_ids, pks = self._match_row_ids(table, where)
+        return list(zip(pks.tolist(), row_ids.tolist()))
 
     def _compare_mask(self, table, row_ids, left, op, right):
         if left["kind"] == "column":
