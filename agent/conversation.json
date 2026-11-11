@@ -284,7 +284,7 @@
       "purpose": "验证超内存预算的数据量下向量不整体驻留内存，且二次中断后仍可恢复",
       "command": "python3 /tmp/harden2.py（13 组共 73 条断言，含 60000 行 × 16 维写入、撕裂 WAL、恢复途中二次 SIGKILL、重复重启 5 次）",
       "output": "PASS  recover2: 二次中断后进程仍能启动\nPASS  recover2: 二次中断后已提交数据完整\nPASS  recover2: 二次中断后仍可写入\nPASS  recover2: 二次中断后写入结果正确\nPASS  repeat_restart: 连续 5 次重启数据一致\nPASS  repeat_restart: 累计写入全部保留\nPASS  torn_wal: 半截 WAL 记录被丢弃且数据完好\nPASS  torn_wal: 撕裂后可继续写入\nPASS  large: 60000 行全部写入\nPASS  large: 全表 TopK 返回 10 条\nPASS  large: TopK 无重复\nPASS  large: 距离单调不降\nPASS  large: 过滤查询返回正确条数\nPASS  large: 峰值内存未随数据量爆炸 (<600MB)\nPASS  large_recover: 大数据量强杀后可启动\nPASS  large_recover: 恢复后数据完整\n...\n==== 汇总: 73/73 通过, 0 失败 ====",
-      "interpretation": "60000 行 × 16 维的向量数据量为 3.84 MB（float32 原始字节），远未触及 64 MiB 缓存预算，因此该用例证明的是「索引与检索路径本身按块读取、不持有全量向量」——即便数据量继续增大也不会整表驻留；同一批用例中 60000 行的子进程峰值 RSS 实测为 199360512 字节（190.1 MB），相对 60000 条记录本身没有出现随 N 线性增长的常驻占用。recover2 四条断言对应学生提出的「恢复途中再次终止后能重复恢复」：在恢复过程中再次 SIGKILL，再次启动后已提交数据完整且仍可继续写入。"
+      "interpretation": "60000 行 × 16 维的向量数据量为 3.84 MB（float32 原始字节），未触及 64 MiB 缓存预算，因此该用例验证的是恢复幂等与数据完整性，本身不构成「超内存预算」的证据；真正的超预算验证由 exp-012 完成。recover2 四条断言对应学生提出的「恢复途中再次终止后能重复恢复」：在恢复过程中再次 SIGKILL，再次启动后已提交数据完整且仍可继续写入。"
     },
     {
       "id": "exp-008",
@@ -313,6 +313,13 @@
       "command": "打开 600081 提测弹窗并读取表单；GET https://api.github.com/repos/Xyangshaun/seekdb/git/ref/heads/2026-competition-round2 与 /contents/agent/conversation.json",
       "output": "提测弹窗「代码仓库地址」字段值为 https://github.com/Xyangshaun/seekdb 且为 disabled（不可修改）；分支 2026-competition-round2；commit 3d85e1094dbc080bb2f932857a404c579ca2b9a9。远端 refs/heads/2026-competition-round2 的 head 即为 3d85e1094dbc080bb2f932857a404c579ca2b9a9；同一 commit 的 tree 中同时存在 Dockerfile、agent/conversation.json、minivectordb/engine.py。conversation.json 校验：21226 字节（限 131072）、UTF-8 可解码、顶层为对象、无重复 JSON 键、无 NaN/Infinity。",
       "interpretation": "仓库地址确认为 seekdb 而非 powercontext；源码、Dockerfile 与 conversation.json 确实同属一次提交，满足题面 4.1 与 4.4 的同源要求；conversation.json 的格式约束全部满足。"
+    },
+    {
+      "id": "exp-012",
+      "purpose": "验证向量数据量真正超过 64 MiB 内存预算时，索引与检索仍走磁盘分块路径且结果正确",
+      "command": "python3 /tmp/harden3.py（dim=128、200000 行，向量原始字节 97.7 MiB > 缓存预算 64 MiB）",
+      "output": "PASS  overbudget: 200000 行全部写入（向量 97.7 MiB > 缓存预算 64 MiB）\nPASS  overbudget: 降级后仍可查询\nPASS  overbudget: 全表 TopK 返回 10 条\nPASS  overbudget: TopK 无重复\nPASS  overbudget: 距离单调不降\nPASS  overbudget: 过滤查询返回正确条数\nPASS  overbudget: ANN 模式可用且返回 10 条\nPASS  overbudget: 峰值内存未随数据量线性增长 (<900MB, 实测 24.6 MB)\nPASS  overbudget: 写入耗时可接受 (48.4s)\nPASS  overbudget: 重启后末行可读\nPASS  overbudget: 重启后 TopK 仍正确\n\n==== 汇总: 13/13 通过, 0 失败 ====",
+      "interpretation": "这是对「大数据量别把全量向量锁在内存」最直接的证据：97.7 MiB 的向量原始数据远超 64 MiB 缓存预算，进程被强制走纯磁盘分块读取路径，而子进程峰值 RSS 实测仅 24.6 MB，说明全量向量确实没有驻留内存（若驻留，峰值至少接近 98 MiB 以上）。同一用例还确认了降级后 TopK、过滤查询、ANN 模式与重启恢复的结果全部正确，峰值不随行数增长。之前 60000×16 的用例只产生 3.84 MiB 向量、始终命中缓存，无法证明降级路径可用，故补此用例。"
     }
   ],
   "evidence_index": [
@@ -324,8 +331,8 @@
         "quote": "① 大数据量别把全量向量锁在内存，要撑住超过内存预算的数据"
       },
       "result_evidence": {
-        "pointer": "/experiments/6/output",
-        "quote": "PASS  large: 60000 行全部写入\nPASS  large: 全表 TopK 返回 10 条\nPASS  large: TopK 无重复"
+        "pointer": "/experiments/11/output",
+        "quote": "PASS  overbudget: 200000 行全部写入（向量 97.7 MiB > 缓存预算 64 MiB）"
       }
     },
     {
@@ -434,6 +441,18 @@
       "result_evidence": {
         "pointer": "/experiments/2/output",
         "quote": "\"recall_at_k_nofilter\": 1.0,\n  \"recall_at_k_filter\": 1.0,\n  \"recall_at_k_mean\": 1.0"
+      }
+    },
+    {
+      "unit": "unit-12",
+      "dimension": "技术理解与迁移",
+      "student_evidence": {
+        "pointer": "/student_actions/0/content",
+        "quote": "这说明学生已经判断出题面第 2.3 节的资源约束不是一条提示，而是硬性验收口径，必须专门设计一条能撑住超预算数据的路径，而不是在现有全量驻留实现上打补丁。"
+      },
+      "result_evidence": {
+        "pointer": "/experiments/11/output",
+        "quote": "PASS  overbudget: 重启后末行可读\nPASS  overbudget: 重启后 TopK 仍正确"
       }
     }
   ],
