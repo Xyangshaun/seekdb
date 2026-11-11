@@ -166,6 +166,8 @@ class Engine:
         }
         self.db.create_table(name, schema)
         self.db.commit()
+        if vector_columns:
+            self.indexes[name] = self._build_index(self.db.tables[name])
         return {}
 
     def exec_create_vector_index(self, statement):
@@ -287,17 +289,23 @@ class Engine:
         for assignment in statement["assignments"]:
             if assignment["column"] not in column_types:
                 raise NoSuchColumn("unknown column %s" % assignment["column"])
-        if table.primary_key in [a["column"] for a in statement["assignments"]]:
-            raise UnsupportedSQL("updating the primary key is not supported")
         self._snapshot(table)
         targets = self._match_rows(table, statement["where"])
-        affected = 0
+        # 先整体校验：任何一行失败都不能留下部分修改，改主键的冲突也要先查清
+        prepared = []
         for pk, row_id in targets:
             values = self._row_values(table, row_id)
             updated = dict(values)
             for assignment in statement["assignments"]:
                 updated[assignment["column"]] = self._coerce(
                     table, column_types[assignment["column"]], assignment["value"])
+            new_pk = updated[table.primary_key]
+            if new_pk in table.live and table.live[new_pk] != row_id:
+                raise DuplicateKey("duplicate primary key %r" % new_pk)
+            prepared.append((pk, row_id, updated))
+        affected = 0
+        for pk, row_id, updated in prepared:
+            new_pk = updated[table.primary_key]
             new_row_id = table.allocate_row_id()
             vector = updated.get(table.vector_column) if table.vector_column else None
             if vector is None and table.vector_column:
@@ -305,8 +313,12 @@ class Engine:
                 vector = table.read_vector(row_id)
             if vector is not None:
                 table.write_vector(new_row_id, np.asarray(vector, dtype=np.float32).tolist())
-            table.write_row(new_row_id, pk, updated)
-            table.row_pk.pop(row_id, None)
+            table.write_row(new_row_id, new_pk, updated)
+            if new_pk != pk:
+                # 旧主键必须显式写删除记录，崩溃恢复时才不会让旧行复活
+                table.delete_row(row_id, pk)
+            else:
+                table.row_pk.pop(row_id, None)
             affected += 1
         self._invalidate_index(table)
         self._maybe_commit()
@@ -328,6 +340,9 @@ class Engine:
         table = self._get_table(statement["table"])
         resolved = [self._resolve_projection(table, p) for p in statement["projections"]]
         order_terms = [self._resolve_order_term(table, t) for t in statement["order_by"] or []]
+        for term in order_terms:
+            if term["kind"] == "distance":
+                term["query_array"] = self._coerce_vector_for_query(table, term["query"])
         limit = statement["limit"]
         has_distance = any(r["kind"] == "distance" for r in resolved)
         if has_distance:
@@ -391,7 +406,13 @@ class Engine:
                 values = column.compare_array(row_ids)
                 keys.append((term, values))
             else:
-                keys.append((term, None))
+                query_vec = term.get("query_array")
+                if query_vec is None:
+                    query_vec = self._coerce_vector_for_query(table, term["query"])
+                vectors = table.vector_block(row_ids)
+                diff = vectors - query_vec
+                distances = np.sqrt((diff * diff).sum(axis=1)).astype(np.float64)
+                keys.append((term, distances))
         order = self._sort_indices(keys, row_ids, table)
         if limit is not None:
             order = order[:limit]
@@ -414,8 +435,10 @@ class Engine:
                         continue
                     result = -1 if a < b else 1
                 else:
-                    a = int(a)
-                    b = int(b)
+                    if isinstance(a, (int, np.integer)) and isinstance(b, (int, np.integer)):
+                        a, b = int(a), int(b)
+                    else:
+                        a, b = float(a), float(b)
                     if a == b:
                         continue
                     result = -1 if a < b else 1
@@ -515,12 +538,12 @@ class Engine:
 
     def _ann_search(self, table, query_vector, k, row_ids):
         index = self.indexes.get(table.name)
-        if index is None or index.vectors is None or index.vectors.shape[0] == 0:
-            return []
         live_row_ids = set(table.live.values())
-        if index.dirty or set(index.row_ids) != live_row_ids:
+        if index is None or index.dirty or set(index.row_ids) != live_row_ids:
             index = self._build_index(table)
             self.indexes[table.name] = index
+        if index.vectors is None or index.vectors.shape[0] == 0:
+            return []
         allowed = set(row_ids.tolist())
         candidates = index.search(query_vector, k, allowed=allowed)
         return [(row_id, distance) for row_id, distance in candidates]
